@@ -566,15 +566,15 @@ fn simdJsonEscape(data: []const u8, buf: []u8) usize {
     // SIMD fast path: check 16 bytes at a time for escape-needing chars
     while (i + simd_width <= data.len and pos + simd_width + 16 <= buf.len) {
         const chunk: @Vector(simd_width, u8) = data[i..][0..simd_width].*;
-        // Check for chars that need escaping: < 0x20 (control), '"', '\'
-        const needs_escape_ctrl = chunk < @as(@Vector(simd_width, u8), @splat(0x20));
-        const needs_escape_quote = chunk == @as(@Vector(simd_width, u8), @splat('"'));
-        const needs_escape_backslash = chunk == @as(@Vector(simd_width, u8), @splat('\\'));
-        const needs_escape = @bitCast(@as(@Vector(simd_width, bool), needs_escape_ctrl) |
-            @as(@Vector(simd_width, bool), needs_escape_quote) |
-            @as(@Vector(simd_width, bool), needs_escape_backslash));
+        // Check for chars needing escape: control (<0x20), quote, backslash
+        const ctrl_mask = chunk < @as(@Vector(simd_width, u8), @splat(0x20));
+        const quote_mask = chunk == @as(@Vector(simd_width, u8), @splat('"'));
+        const bslash_mask = chunk == @as(@Vector(simd_width, u8), @splat('\\'));
+        const any_ctrl = @reduce(.Or, ctrl_mask);
+        const any_quote = @reduce(.Or, quote_mask);
+        const any_bslash = @reduce(.Or, bslash_mask);
 
-        if (!@reduce(.Or, needs_escape)) {
+        if (!any_ctrl and !any_quote and !any_bslash) {
             // Fast path: no escaping needed, bulk copy
             @memcpy(buf[pos..][0..simd_width], data[i..][0..simd_width]);
             pos += simd_width;

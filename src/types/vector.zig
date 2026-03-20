@@ -3,9 +3,6 @@
 // SIMD-accelerated: uses @Vector for batch float32 endian conversion.
 
 const std = @import("std");
-const types = @import("../types.zig");
-const buffer = @import("../buffer.zig");
-const lib = @import("../lib.zig");
 
 pub const Vector = struct {
     // pgvector registers dynamically — OID varies per database.
@@ -39,7 +36,6 @@ pub const Vector = struct {
         // SIMD path: process 4 floats at a time using @Vector
         const simd_width = 4;
         const simd_batches = dim / simd_width;
-        const remainder = dim % simd_width;
 
         var i: usize = 0;
         while (i < simd_batches) : (i += 1) {
@@ -85,7 +81,6 @@ pub const Vector = struct {
         // SIMD batch decode + format
         const simd_width = 4;
         const simd_batches = dim / simd_width;
-        const remainder = dim % simd_width;
 
         var batch: usize = 0;
         while (batch < simd_batches) : (batch += 1) {
@@ -120,8 +115,6 @@ pub const Vector = struct {
             const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
             pos += s.len;
         }
-
-        _ = remainder;
 
         buf[pos] = ']';
         pos += 1;
