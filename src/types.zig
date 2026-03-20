@@ -1412,6 +1412,12 @@ fn bindSlice(oid: i32, value: anytype, buf: *buffer.Buffer, format_pos: usize) !
             JSON.oid.decimal => return JSON.encodeBytes(value, buf, format_pos),
             MacAddr.oid.decimal => return MacAddr.encode(value, buf, format_pos),
             MacAddr8.oid.decimal => return MacAddr8.encode(value, buf, format_pos),
+            Bool.oid.decimal => {
+                const b = std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "t") or
+                    std.mem.eql(u8, value, "yes") or std.mem.eql(u8, value, "on") or
+                    std.mem.eql(u8, value, "1");
+                return Bool.encode(b, buf, format_pos);
+            },
             CharArray.oid.decimal => {
                 // This is actually an array, and in theory we could let it fallthrough
                 // to the binary-array handling. BUT, if we do that, the code won't compile
