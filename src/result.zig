@@ -405,7 +405,7 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             const value = self.get(field.type, column_index);
             const a = allocator orelse return value;
             return mapValue(T, if (comptime fail_mode == .safe) try value else value, a);
-        };
+        }
 
         /// Write a single column's value as JSON to a buffer.
         /// Handles all Postgres types: int, float, numeric, bool, text, jsonb, arrays, timestamps.
