@@ -555,7 +555,6 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
         }
     };
 }
-}
 
 /// Parse Postgres binary int array and write as JSON: [1,2,3]
 fn writeIntArrayJson(data: []const u8, oid: i32, buf: []u8) usize {
