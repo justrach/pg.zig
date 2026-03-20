@@ -30,7 +30,7 @@ pub const binary_encoding = [2]u8{ 0, 1 };
 
 pub const Cidr = @import("types/cidr.zig").Cidr;
 pub const Numeric = @import("types/numeric.zig").Numeric;
-
+pub const Vector = @import("types/vector.zig").Vector;
 pub const Char = struct {
     // A blank-padded char
     pub const oid = OID.make(1042);

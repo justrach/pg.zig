@@ -501,21 +501,20 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
                     buf[pos] = '"';
                     pos += 1;
                 },
-                // Text, varchar, name, char, and everything else — quote as string
+                // Everything else — check for pgvector, then fall back to quoted string
                 else => {
+                    // pgvector support — dynamic OID, check at runtime
+                    if (types.Vector.oid_decimal != 0 and oid == types.Vector.oid_decimal) {
+                        const vec = types.Vector.decode(data);
+                        pos += vec.writeJson(buf[pos..]);
+                        return pos;
+                    }
+                    // Default: quote as string (SIMD-accelerated escape scan)
                     buf[pos] = '"';
                     pos += 1;
-                    for (data) |ch| {
-                        if (pos + 2 >= buf.len) break;
-                        if (ch == '"' or ch == '\\') {
-                            buf[pos] = '\\';
-                            pos += 1;
-                        }
-                        if (ch >= 0x20) {
-                            buf[pos] = ch;
-                            pos += 1;
-                        }
-                    }
+                    pos += simdJsonEscape(data, buf[pos..]);
+                    buf[pos] = '"';
+                    pos += 1;
                     buf[pos] = '"';
                     pos += 1;
                 },
@@ -554,6 +553,63 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             return pos;
         }
     };
+}
+
+/// SIMD-accelerated JSON string escaping.
+/// Scans 16 bytes at a time for chars needing escape (", \, control chars).
+/// Falls back to scalar for remainder and when escapes are found.
+fn simdJsonEscape(data: []const u8, buf: []u8) usize {
+    const simd_width = 16;
+    var pos: usize = 0;
+    var i: usize = 0;
+
+    // SIMD fast path: check 16 bytes at a time for escape-needing chars
+    while (i + simd_width <= data.len and pos + simd_width + 16 <= buf.len) {
+        const chunk: @Vector(simd_width, u8) = data[i..][0..simd_width].*;
+        // Check for chars that need escaping: < 0x20 (control), '"', '\'
+        const needs_escape_ctrl = chunk < @as(@Vector(simd_width, u8), @splat(0x20));
+        const needs_escape_quote = chunk == @as(@Vector(simd_width, u8), @splat('"'));
+        const needs_escape_backslash = chunk == @as(@Vector(simd_width, u8), @splat('\\'));
+        const needs_escape = @bitCast(@as(@Vector(simd_width, bool), needs_escape_ctrl) |
+            @as(@Vector(simd_width, bool), needs_escape_quote) |
+            @as(@Vector(simd_width, bool), needs_escape_backslash));
+
+        if (!@reduce(.Or, needs_escape)) {
+            // Fast path: no escaping needed, bulk copy
+            @memcpy(buf[pos..][0..simd_width], data[i..][0..simd_width]);
+            pos += simd_width;
+            i += simd_width;
+        } else {
+            // Slow path: at least one char needs escaping, do scalar
+            for (data[i..][0..simd_width]) |ch| {
+                if (ch == '"' or ch == '\\') {
+                    buf[pos] = '\\';
+                    pos += 1;
+                }
+                if (ch >= 0x20) {
+                    buf[pos] = ch;
+                    pos += 1;
+                }
+            }
+            i += simd_width;
+        }
+    }
+
+    // Scalar remainder
+    while (i < data.len and pos + 2 < buf.len) {
+        const ch = data[i];
+        if (ch == '"' or ch == '\\') {
+            buf[pos] = '\\';
+            pos += 1;
+        }
+        if (ch >= 0x20) {
+            buf[pos] = ch;
+            pos += 1;
+        }
+        i += 1;
+    }
+
+    return pos;
 }
 
 /// Parse Postgres binary int array and write as JSON: [1,2,3]
