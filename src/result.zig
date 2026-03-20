@@ -515,8 +515,6 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
                     pos += simdJsonEscape(data, buf[pos..]);
                     buf[pos] = '"';
                     pos += 1;
-                    buf[pos] = '"';
-                    pos += 1;
                 },
             }
             return pos;
