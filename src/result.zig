@@ -405,8 +405,278 @@ pub fn RowT(comptime fail_mode: lib.FailMode) type {
             const value = self.get(field.type, column_index);
             const a = allocator orelse return value;
             return mapValue(T, if (comptime fail_mode == .safe) try value else value, a);
+        };
+
+        /// Write a single column's value as JSON to a buffer.
+        /// Handles all Postgres types: int, float, numeric, bool, text, jsonb, arrays, timestamps.
+        /// Returns the number of bytes written.
+        pub fn writeJsonValue(self: *const Self, col: usize, buf: []u8) usize {
+            const value = self.values[col];
+            if (value.is_null) {
+                if (buf.len < 4) return 0;
+                @memcpy(buf[0..4], "null");
+                return 4;
+            }
+
+            const data = value.data;
+            const oid = self.oids[col];
+            var pos: usize = 0;
+
+            switch (oid) {
+                // Integers
+                21 => { // int2
+                    const v = std.mem.readInt(i16, data[0..2], .big);
+                    const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch return 0;
+                    pos += s.len;
+                },
+                23 => { // int4
+                    const v = std.mem.readInt(i32, data[0..4], .big);
+                    const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch return 0;
+                    pos += s.len;
+                },
+                20 => { // int8
+                    const v = std.mem.readInt(i64, data[0..8], .big);
+                    const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch return 0;
+                    pos += s.len;
+                },
+                // Floats
+                700 => { // float4
+                    const n = std.mem.readInt(i32, data[0..4], .big);
+                    const v: f32 = @bitCast(n);
+                    const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch return 0;
+                    pos += s.len;
+                },
+                701 => { // float8
+                    const n = std.mem.readInt(i64, data[0..8], .big);
+                    const v: f64 = @bitCast(n);
+                    const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch return 0;
+                    pos += s.len;
+                },
+                // Numeric/Decimal — decode via Numeric type then format
+                1700 => {
+                    const numeric = types.Numeric.decode(fail_mode, data, oid) catch {
+                        @memcpy(buf[pos..][0..4], "null");
+                        return pos + 4;
+                    };
+                    const v = numeric.toFloat();
+                    const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch return 0;
+                    pos += s.len;
+                },
+                // Bool
+                16 => {
+                    const v = data[0] != 0;
+                    const s = if (v) "true" else "false";
+                    @memcpy(buf[pos..][0..s.len], s);
+                    pos += s.len;
+                },
+                // JSON — already valid JSON, pass through
+                114 => {
+                    @memcpy(buf[pos..][0..data.len], data);
+                    pos += data.len;
+                },
+                // JSONB — strip version byte, pass through
+                3802 => {
+                    const json_data = data[1..];
+                    @memcpy(buf[pos..][0..json_data.len], json_data);
+                    pos += json_data.len;
+                },
+                // Integer arrays
+                1005, 1007, 1016 => { // int2[], int4[], int8[]
+                    pos += writeIntArrayJson(data, oid, buf[pos..]);
+                },
+                // Text arrays
+                1009, 1015 => { // text[], varchar[]
+                    pos += writeTextArrayJson(data, buf[pos..]);
+                },
+                // Timestamp — format as ISO 8601
+                1114, 1184 => { // timestamp, timestamptz
+                    const usec = std.mem.readInt(i64, data[0..8], .big);
+                    // Postgres epoch is 2000-01-01, Unix is 1970-01-01
+                    const pg_epoch_offset: i64 = 946684800;
+                    const unix_sec = @divTrunc(usec, 1_000_000) + pg_epoch_offset;
+                    buf[pos] = '"';
+                    pos += 1;
+                    const s = std.fmt.bufPrint(buf[pos..], "{d}", .{unix_sec}) catch return 0;
+                    pos += s.len;
+                    buf[pos] = '"';
+                    pos += 1;
+                },
+                // Text, varchar, name, char, and everything else — quote as string
+                else => {
+                    buf[pos] = '"';
+                    pos += 1;
+                    for (data) |ch| {
+                        if (pos + 2 >= buf.len) break;
+                        if (ch == '"' or ch == '\\') {
+                            buf[pos] = '\\';
+                            pos += 1;
+                        }
+                        if (ch >= 0x20) {
+                            buf[pos] = ch;
+                            pos += 1;
+                        }
+                    }
+                    buf[pos] = '"';
+                    pos += 1;
+                },
+            }
+            return pos;
+        }
+
+        /// Write an entire row as a JSON object: {"col1":val1,"col2":val2,...}
+        /// Requires column_names to be populated (queryOpts with .column_names = true).
+        pub fn writeJsonRow(self: *const Self, col_names: []const []const u8, buf: []u8) usize {
+            var pos: usize = 0;
+            buf[pos] = '{';
+            pos += 1;
+
+            const ncols = @min(col_names.len, self.values.len);
+            for (0..ncols) |i| {
+                if (i > 0) {
+                    buf[pos] = ',';
+                    pos += 1;
+                }
+                // Column name
+                buf[pos] = '"';
+                pos += 1;
+                @memcpy(buf[pos..][0..col_names[i].len], col_names[i]);
+                pos += col_names[i].len;
+                buf[pos] = '"';
+                pos += 1;
+                buf[pos] = ':';
+                pos += 1;
+                // Value
+                pos += self.writeJsonValue(i, buf[pos..]);
+            }
+
+            buf[pos] = '}';
+            pos += 1;
+            return pos;
         }
     };
+}
+}
+
+/// Parse Postgres binary int array and write as JSON: [1,2,3]
+fn writeIntArrayJson(data: []const u8, oid: i32, buf: []u8) usize {
+    // Postgres binary array format:
+    // 4 bytes: ndim, 4 bytes: flags, 4 bytes: element OID
+    // per dimension: 4 bytes length, 4 bytes lower bound
+    // then: per element: 4 bytes length (or -1 for null), then data
+    if (data.len < 12) {
+        @memcpy(buf[0..2], "[]");
+        return 2;
+    }
+
+    const ndim = std.mem.readInt(i32, data[0..4], .big);
+    if (ndim == 0) {
+        @memcpy(buf[0..2], "[]");
+        return 2;
+    }
+
+    // Element size based on array OID
+    const elem_size: usize = switch (oid) {
+        1005 => 2, // int2[]
+        1007 => 4, // int4[]
+        1016 => 8, // int8[]
+        else => 4,
+    };
+
+    const nelems = std.mem.readInt(i32, data[12..16], .big);
+    var pos: usize = 0;
+    buf[pos] = '[';
+    pos += 1;
+
+    var offset: usize = 20; // skip header (12 + 4 length + 4 lower bound)
+    var i: i32 = 0;
+    while (i < nelems and offset + 4 <= data.len) : (i += 1) {
+        if (i > 0) {
+            buf[pos] = ',';
+            pos += 1;
+        }
+        const elem_len = std.mem.readInt(i32, data[offset..][0..4], .big);
+        offset += 4;
+        if (elem_len == -1) {
+            @memcpy(buf[pos..][0..4], "null");
+            pos += 4;
+        } else if (elem_size == 2 and offset + 2 <= data.len) {
+            const v = std.mem.readInt(i16, data[offset..][0..2], .big);
+            const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+            pos += s.len;
+            offset += 2;
+        } else if (elem_size == 4 and offset + 4 <= data.len) {
+            const v = std.mem.readInt(i32, data[offset..][0..4], .big);
+            const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+            pos += s.len;
+            offset += 4;
+        } else if (elem_size == 8 and offset + 8 <= data.len) {
+            const v = std.mem.readInt(i64, data[offset..][0..8], .big);
+            const s = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
+            pos += s.len;
+            offset += 8;
+        } else {
+            offset += @intCast(@as(u32, @bitCast(elem_len)));
+        }
+    }
+
+    buf[pos] = ']';
+    pos += 1;
+    return pos;
+}
+
+/// Parse Postgres binary text array and write as JSON: ["a","b","c"]
+fn writeTextArrayJson(data: []const u8, buf: []u8) usize {
+    if (data.len < 12) {
+        @memcpy(buf[0..2], "[]");
+        return 2;
+    }
+
+    const ndim = std.mem.readInt(i32, data[0..4], .big);
+    if (ndim == 0) {
+        @memcpy(buf[0..2], "[]");
+        return 2;
+    }
+
+    const nelems = std.mem.readInt(i32, data[12..16], .big);
+    var pos: usize = 0;
+    buf[pos] = '[';
+    pos += 1;
+
+    var offset: usize = 20;
+    var i: i32 = 0;
+    while (i < nelems and offset + 4 <= data.len) : (i += 1) {
+        if (i > 0) {
+            buf[pos] = ',';
+            pos += 1;
+        }
+        const elem_len = std.mem.readInt(i32, data[offset..][0..4], .big);
+        offset += 4;
+        if (elem_len == -1) {
+            @memcpy(buf[pos..][0..4], "null");
+            pos += 4;
+        } else {
+            const slen: usize = @intCast(@as(u32, @bitCast(elem_len)));
+            if (offset + slen > data.len) break;
+            buf[pos] = '"';
+            pos += 1;
+            for (data[offset..][0..slen]) |ch| {
+                if (pos + 2 >= buf.len) break;
+                if (ch == '"' or ch == '\\') {
+                    buf[pos] = '\\';
+                    pos += 1;
+                }
+                buf[pos] = ch;
+                pos += 1;
+            }
+            buf[pos] = '"';
+            pos += 1;
+            offset += slen;
+        }
+    }
+
+    buf[pos] = ']';
+    pos += 1;
+    return pos;
 }
 
 fn isSlice(comptime T: type) ?type {
