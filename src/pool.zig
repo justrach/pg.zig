@@ -31,6 +31,8 @@ pub const Pool = struct {
         connect: Conn.Opts = .{},
         timeout: u32 = 10 * std.time.ms_per_s,
         connect_on_init_count: ?u16 = null,
+        max_queries_per_conn: u64 = 0, // 0 = unlimited
+        max_conn_lifetime: i64 = 0, // 0 = unlimited (seconds)
     };
 
     pub const Stats = struct {
@@ -160,19 +162,26 @@ pub const Pool = struct {
 
     pub fn release(self: *Pool, conn: *Conn) void {
         var conn_to_add = conn;
+        var needs_replace = conn._state != .idle;
 
-        if (conn._state != .idle) {
-            lib.metrics.poolDirty();
-            // conn should always be idle when being released. It's possible we can
-            // recover from this (e.g. maybe we just need to read until we get a
-            // ReadyForQuery), but we wouldn't want to block for too long. For now,
-            // we'll just replace the connection.
+        if (!needs_replace) {
+            // Check if connection should be rotated (query count or age)
+            const opts = self._opts;
+            if (opts.max_queries_per_conn > 0 and conn.queryCount() >= opts.max_queries_per_conn) {
+                needs_replace = true;
+            } else if (opts.max_conn_lifetime > 0 and conn.age() >= opts.max_conn_lifetime) {
+                needs_replace = true;
+            }
+        }
+
+        if (needs_replace) {
+            if (conn._state != .idle) {
+                lib.metrics.poolDirty();
+            }
             conn.deinit();
             self._allocator.destroy(conn);
 
             conn_to_add = newConnection(self, true) catch |err1| {
-                // we failed to create the connection, track it as missing and let
-                // the background reconnector try
                 self._mutex.lock();
                 self._missing += 1;
                 self._mutex.unlock();

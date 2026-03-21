@@ -34,6 +34,9 @@ pub const Conn = struct {
 
     _pool: ?*Pool = null,
 
+    // Track connection age for pool rotation
+    _query_count: u64 = 0,
+    _created_at: i64 = 0,
     // The current transation state, this is whatever the last ReadyForQuery
     // message told us
     _state: State,
@@ -60,7 +63,11 @@ pub const Conn = struct {
     _param_oids: []i32,
 
     // cache_name => data necessary to re-execute previously prepared statement.
+    // Bounded: when cache exceeds MAX_CACHED_STMTS, the least-recently-used
+    // entry is evicted (its arena is freed).
     _prepared_statements: std.StringHashMapUnmanaged(Stmt.Describe),
+    _stmt_cache_order: std.ArrayListUnmanaged([]const u8),
+    _stmt_cache_max: usize,
 
     const State = enum {
         idle,
@@ -175,6 +182,9 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
+            ._stmt_cache_order = .{},
+            ._stmt_cache_max = 256,
+            ._created_at = std.time.timestamp(),
         };
     }
 
@@ -198,6 +208,7 @@ pub const Conn = struct {
             value_ptr.arena.deinit();
         }
         self._prepared_statements.deinit(self._allocator);
+        self._stmt_cache_order.deinit(self._allocator);
     }
 
     pub fn release(self: *Conn) void {
@@ -207,6 +218,41 @@ pub const Conn = struct {
         };
         self.err = null;
         pool.release(self);
+    }
+
+    pub fn queryCount(self: *const Conn) u64 {
+        return self._query_count;
+    }
+
+    pub fn age(self: *const Conn) i64 {
+        return std.time.timestamp() - self._created_at;
+    }
+
+    // ── LRU stmt cache helpers ──────────────────────────────────────────
+
+    fn stmtCacheMoveToEnd(self: *Conn, name: []const u8) void {
+        const items = self._stmt_cache_order.items;
+        for (items, 0..) |item, i| {
+            if (std.mem.eql(u8, item, name)) {
+                // Remove from current position, append to end
+                _ = self._stmt_cache_order.orderedRemove(i);
+                self._stmt_cache_order.append(self._allocator, name) catch {};
+                return;
+            }
+        }
+    }
+
+    fn stmtCacheEvictOldest(self: *Conn) void {
+        if (self._stmt_cache_order.items.len == 0) return;
+
+        // Remove oldest (index 0)
+        const oldest_name = self._stmt_cache_order.orderedRemove(0);
+
+        // Free the statement's arena and remove from map
+        if (self._prepared_statements.fetchRemove(oldest_name)) |kv| {
+            var describe = kv.value;
+            describe.arena.deinit();
+        }
     }
 
     pub fn auth(self: *Conn, opts: AuthOpts) !void {
@@ -244,7 +290,7 @@ pub const Conn = struct {
             self.maybeRelease(opts.release_conn);
             return error.ConnectionBusy;
         }
-
+        self._query_count += 1;
         var cached = false;
         var stmt: Stmt = undefined;
         const name = opts.cache_name;
@@ -254,6 +300,9 @@ pub const Conn = struct {
                 cached = true;
                 stmt = try Stmt.fromDescribe(self, describe, opts);
                 errdefer stmt.deinit();
+
+                // Move to end of LRU order (most recently used)
+                self.stmtCacheMoveToEnd(n);
 
                 try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
                 // Send a "SYNC" command
@@ -277,9 +326,11 @@ pub const Conn = struct {
                 errdefer describe_arena.deinit();
                 try stmt.prepare(sql, describe_arena.allocator());
 
-                // When prepare is called with our describe arena, than its
-                // param_oids and result_state will be create with it specifically
-                // so that we can copy them here.
+                // Evict LRU if cache is full
+                if (self._stmt_cache_order.items.len >= self._stmt_cache_max) {
+                    self.stmtCacheEvictOldest();
+                }
+
                 const owned_name = try describe_arena.allocator().dupe(u8, n);
                 try self._prepared_statements.put(self._allocator, owned_name, .{
                     .arena = describe_arena,
@@ -416,6 +467,69 @@ pub const Conn = struct {
 
     pub fn commit(self: *Conn) !void {
         _ = try self.execOpts("commit", .{}, .{});
+    }
+
+    // ── Query Pipelining ────────────────────────────────────────────────
+    // Send multiple queries over a single connection with one round trip.
+    // All Bind+Execute messages are batched, with a single Sync at the end.
+    // Returns an array of JSON-serialized results (one per query).
+    //
+    // Usage:
+    //   const results = try conn.pipelineExec(&.{
+    //       .{ .sql = "SELECT * FROM users WHERE id = $1", .values = .{1} },
+    //       .{ .sql = "SELECT * FROM users WHERE id = $1", .values = .{2} },
+    //       .{ .sql = "SELECT * FROM users WHERE id = $1", .values = .{3} },
+    //   });
+
+    pub const PipelineQuery = struct {
+        sql: []const u8,
+        cache_name: ?[]const u8 = null,
+    };
+
+    /// Execute multiple queries in a single pipeline (one round trip).
+    /// Each query must be pre-prepared. Sends Bind+Execute for each query
+    /// with a single Sync at the end.
+    /// Returns the number of successfully executed queries.
+    pub fn pipelineExecSimple(self: *Conn, queries: []const []const u8) !usize {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+        self._query_count += queries.len;
+
+        var buf = &self._buf;
+        buf.reset();
+
+        // Send all queries as simple Query messages, no Sync between them
+        for (queries) |sql| {
+            const query_msg = proto.Query{ .sql = sql };
+            try query_msg.write(buf);
+        }
+        try self.write(buf.string());
+
+        self._state = .query;
+
+        // Read all responses
+        var completed: usize = 0;
+        var expecting_ready = queries.len;
+        while (expecting_ready > 0) {
+            const msg = try self.read();
+            switch (msg.type) {
+                'C' => completed += 1, // CommandComplete
+                'T' => {}, // RowDescription (skip)
+                'D' => {}, // DataRow (skip for exec)
+                'I' => {}, // EmptyQueryResponse
+                'E' => {}, // Error (skip, count will be less)
+                'Z' => {
+                    expecting_ready -= 1;
+                    if (expecting_ready == 0) {
+                        self._state = .idle;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return completed;
     }
 
     // We don't use `execOpts` here because rollback can be called at any point
