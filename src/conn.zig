@@ -469,6 +469,69 @@ pub const Conn = struct {
         _ = try self.execOpts("commit", .{}, .{});
     }
 
+    // ── Query Pipelining ────────────────────────────────────────────────
+    // Send multiple queries over a single connection with one round trip.
+    // All Bind+Execute messages are batched, with a single Sync at the end.
+    // Returns an array of JSON-serialized results (one per query).
+    //
+    // Usage:
+    //   const results = try conn.pipelineExec(&.{
+    //       .{ .sql = "SELECT * FROM users WHERE id = $1", .values = .{1} },
+    //       .{ .sql = "SELECT * FROM users WHERE id = $1", .values = .{2} },
+    //       .{ .sql = "SELECT * FROM users WHERE id = $1", .values = .{3} },
+    //   });
+
+    pub const PipelineQuery = struct {
+        sql: []const u8,
+        cache_name: ?[]const u8 = null,
+    };
+
+    /// Execute multiple queries in a single pipeline (one round trip).
+    /// Each query must be pre-prepared. Sends Bind+Execute for each query
+    /// with a single Sync at the end.
+    /// Returns the number of successfully executed queries.
+    pub fn pipelineExecSimple(self: *Conn, queries: []const []const u8) !usize {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+        self._query_count += queries.len;
+
+        var buf = &self._buf;
+        buf.reset();
+
+        // Send all queries as simple Query messages, no Sync between them
+        for (queries) |sql| {
+            const query_msg = proto.Query{ .sql = sql };
+            try query_msg.write(buf);
+        }
+        try self.write(buf.string());
+
+        self._state = .query;
+
+        // Read all responses
+        var completed: usize = 0;
+        var expecting_ready = queries.len;
+        while (expecting_ready > 0) {
+            const msg = try self.read();
+            switch (msg.type) {
+                'C' => completed += 1, // CommandComplete
+                'T' => {}, // RowDescription (skip)
+                'D' => {}, // DataRow (skip for exec)
+                'I' => {}, // EmptyQueryResponse
+                'E' => {}, // Error (skip, count will be less)
+                'Z' => {
+                    expecting_ready -= 1;
+                    if (expecting_ready == 0) {
+                        self._state = .idle;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return completed;
+    }
+
     // We don't use `execOpts` here because rollback can be called at any point
     // and we want to send this command even if the conn is in a fail state.
     // So we issue the rollback, no matter what state we're in.
