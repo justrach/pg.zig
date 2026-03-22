@@ -29,6 +29,10 @@ pub const Stmt = struct {
     // Number of parameters in the query.
     param_count: u16,
 
+    // Offset of the current Bind message inside the write buffer so we can
+    // patch its length without scanning arbitrary payload bytes.
+    bind_start: usize,
+
     // The type of each parameter, which postgresql tells us after we send it the
     // SQL and ask for a description. `param_oids.len` can be greater than
     // `param_count` because we initially use the conn._param_oids which is
@@ -60,6 +64,7 @@ pub const Stmt = struct {
             .arena = arena,
             .param_index = 0,
             .param_count = 0,
+            .bind_start = 0,
             .param_oids = conn._param_oids,
             .column_count = 0,
             .result_state = conn._result_state,
@@ -79,6 +84,7 @@ pub const Stmt = struct {
             .arena = arena,
             .param_index = 0,
             .param_count = @intCast(describe.param_oids.len),
+            .bind_start = 0,
             .param_oids = describe.param_oids,
             .column_count = @intCast(describe.result_state.oids.len),
             .result_state = describe.result_state,
@@ -261,6 +267,7 @@ pub const Stmt = struct {
 
         var buf = self.buf;
         const name = self.name;
+        self.bind_start = buf.len();
 
         // Bind command = 'B'
         // 4 byte length placeholder - 0, 0, 0, 0
@@ -320,16 +327,9 @@ pub const Stmt = struct {
 
         try lib.types.resultEncoding(self.result_state.oids[0..self.column_count], buf);
         const bind_end = buf.len();
-        const bind_start = blk: {
-            var pos = bind_end;
-            while (pos > 0) : (pos -= 1) {
-                if (buf.buf[pos - 1] == 'B') break :blk pos - 1;
-            }
-            unreachable;
-        };
         var bind_len: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bind_len, @intCast(bind_end - bind_start - 1), .big);
-        @memcpy(buf.buf[bind_start + 1 .. bind_start + 5], &bind_len);
+        std.mem.writeInt(u32, &bind_len, @intCast(bind_end - self.bind_start - 1), .big);
+        @memcpy(buf.buf[self.bind_start + 1 .. self.bind_start + 5], &bind_len);
 
         try buf.write(&.{
             'E',
