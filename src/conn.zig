@@ -519,14 +519,14 @@ pub const Conn = struct {
         }
 
         // Send CopyData messages (type 'd'), each row as tab-separated text + newline
-        for (rows) |row| {
+        for (rows) |copy_row| {
             buf.reset();
             // CopyData message: 'd' + length + data
             try buf.writeByte('d');
             const len_pos = buf.len();
             try buf.write(&.{ 0, 0, 0, 0 }); // placeholder for length
 
-            for (row, 0..) |val, i| {
+            for (copy_row, 0..) |val, i| {
                 if (i > 0) try buf.writeByte('\t');
                 try buf.write(val);
             }
