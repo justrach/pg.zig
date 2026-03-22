@@ -13,6 +13,7 @@ const Stream = lib.Stream;
 const Timeout = lib.Timeout;
 const QueryRow = lib.QueryRow;
 const QueryRowUnsafe = lib.QueryRowUnsafe;
+const DynamicValue = lib.types.DynamicValue;
 const has_openssl = lib.has_openssl;
 
 const os = std.os;
@@ -404,6 +405,93 @@ pub const Conn = struct {
         return self.execOpts(sql, values, .{});
     }
 
+    pub fn execManyDynamic(self: *Conn, sql: []const u8, rows: []const []const DynamicValue, opts: QueryOpts) !i64 {
+        if (rows.len == 0) return 0;
+        if (self.canQuery() == false) return error.ConnectionBusy;
+
+        const auto_transaction = self._state == .idle;
+        if (auto_transaction) try self.begin();
+        errdefer if (auto_transaction) self.rollback() catch {};
+
+        var cached = false;
+        var stmt: Stmt = undefined;
+        const name = opts.cache_name;
+
+        if (name) |n| {
+            if (self._prepared_statements.getPtr(n)) |describe| {
+                cached = true;
+                stmt = try Stmt.fromDescribe(self, describe, opts);
+                errdefer stmt.deinit();
+
+                self.stmtCacheMoveToEnd(n);
+
+                try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
+                stmt.buf.resetRetainingCapacity();
+                try stmt.startBindMessage(@intCast(describe.param_oids.len));
+            }
+        }
+
+        if (!cached) {
+            stmt = try Stmt.init(self, opts);
+            errdefer stmt.deinit();
+
+            if (name) |n| {
+                var describe_arena = ArenaAllocator.init(self._allocator);
+                errdefer describe_arena.deinit();
+                try stmt.prepare(sql, describe_arena.allocator());
+
+                if (self._stmt_cache_order.items.len >= self._stmt_cache_max) {
+                    self.stmtCacheEvictOldest();
+                }
+
+                const owned_name = try describe_arena.allocator().dupe(u8, n);
+                try self._prepared_statements.put(self._allocator, owned_name, .{
+                    .arena = describe_arena,
+                    .param_oids = stmt.param_oids,
+                    .result_state = stmt.result_state,
+                });
+            } else {
+                try stmt.prepare(sql, null);
+            }
+        }
+
+        var total_rows: i64 = 0;
+        var batch_rows: usize = 0;
+        const batch_limit_bytes: usize = 256 * 1024;
+
+        for (rows, 0..) |param_row, row_idx| {
+            if (param_row.len != stmt.param_count) return error.WrongNumberOfParameters;
+            if (row_idx != 0 and batch_rows == 0) {
+                stmt.buf.resetRetainingCapacity();
+                try stmt.startBindMessage(stmt.param_count);
+            } else if (row_idx != 0) {
+                try stmt.startBindMessage(stmt.param_count);
+            }
+
+            for (param_row) |value| {
+                try stmt.bindDynamic(value);
+            }
+
+            const is_last = row_idx + 1 == rows.len;
+            const should_flush = is_last or stmt.buf.len() >= batch_limit_bytes;
+            try stmt.finishExecuteMessage(should_flush);
+            batch_rows += 1;
+
+            if (should_flush) {
+                try self.write(stmt.buf.string());
+                total_rows += try self.consumeExecManyResponses(batch_rows);
+                batch_rows = 0;
+                if (!is_last) {
+                    try self._reader.startFlow(stmt.arena.allocator(), opts.timeout);
+                }
+            }
+        }
+
+        stmt.deinit();
+        if (auto_transaction) try self.commit();
+        return total_rows;
+    }
+
     pub fn execOpts(self: *Conn, sql: []const u8, values: anytype, opts: QueryOpts) !?i64 {
         if (self.canQuery() == false) {
             return error.ConnectionBusy;
@@ -470,6 +558,35 @@ pub const Conn = struct {
 
     pub fn commit(self: *Conn) !void {
         _ = try self.execOpts("commit", .{}, .{});
+    }
+
+    fn consumeExecManyResponses(self: *Conn, expected: usize) !i64 {
+        var completed: usize = 0;
+        var total_rows: i64 = 0;
+
+        while (true) {
+            const msg = self.read() catch |err| {
+                if (err == error.PG) {
+                    self.readyForQuery() catch {};
+                }
+                return err;
+            };
+            switch (msg.type) {
+                '2' => {},
+                'C' => {
+                    const cc = try proto.CommandComplete.parse(msg.data);
+                    total_rows += cc.rowsAffected() orelse 0;
+                    completed += 1;
+                },
+                'I' => completed += 1,
+                'T', 'D' => {},
+                'Z' => {
+                    if (completed != expected) return error.UnexpectedDBMessage;
+                    return total_rows;
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
     }
 
     /// COPY FROM STDIN: bulk insert rows as tab-separated text.

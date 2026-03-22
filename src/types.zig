@@ -21,6 +21,14 @@ pub const OID = struct {
 pub const text_encoding = [2]u8{ 0, 0 };
 pub const binary_encoding = [2]u8{ 0, 1 };
 
+pub const DynamicValue = union(enum) {
+    null,
+    bool: bool,
+    i64: i64,
+    f64: f64,
+    text: []const u8,
+};
+
 // Any "decodeKnown" you see is just an optimization to avoid extra assertions
 // when decoding an individual array value. Once we know the array type, we don't
 // need to assert the oid of each individual value.
@@ -1399,6 +1407,49 @@ pub fn bindValue(comptime T: type, oid: i32, value: anytype, buf: *buffer.Buffer
         },
         .@"enum", .enum_literal => return String.encode(@tagName(value), buf, format_pos),
         else => compileHaltBindError(T),
+    }
+}
+
+pub fn bindDynamicValue(oid: i32, value: DynamicValue, buf: *buffer.Buffer, format_pos: usize) !void {
+    switch (value) {
+        .null => return buf.write(&.{ 255, 255, 255, 255 }),
+        .bool => |v| switch (oid) {
+            Bool.oid.decimal => return Bool.encode(v, buf, format_pos),
+            else => return bindSlice(oid, if (v) "true" else "false", buf, format_pos),
+        },
+        .i64 => |v| switch (oid) {
+            Int16.oid.decimal => {
+                if (v > 32767 or v < -32768) return error.IntWontFit;
+                return Int16.encode(@intCast(v), buf, format_pos);
+            },
+            Int32.oid.decimal, Xid.oid.decimal => {
+                if (v > 2147483647 or v < -2147483648) return error.IntWontFit;
+                return Int32.encode(@intCast(v), buf, format_pos);
+            },
+            Timestamp.oid.decimal, TimestampTz.oid.decimal => return Timestamp.encode(v, buf, format_pos),
+            Numeric.oid.decimal => return Numeric.encode(@as(f64, @floatFromInt(v)), buf, format_pos),
+            Char.oid.decimal => {
+                if (v > 255 or v < 0) return error.IntWontFit;
+                return Char.encode(@intCast(v), buf, format_pos);
+            },
+            Int64.oid.decimal, PgLSN.oid.decimal, Xid8.oid.decimal => return Int64.encode(v, buf, format_pos),
+            else => {
+                var tmp: [32]u8 = undefined;
+                const s = try std.fmt.bufPrint(&tmp, "{d}", .{v});
+                return bindSlice(oid, s, buf, format_pos);
+            },
+        },
+        .f64 => |v| switch (oid) {
+            Float64.oid.decimal => return Float64.encode(v, buf, format_pos),
+            Float32.oid.decimal => return Float32.encode(@floatCast(v), buf, format_pos),
+            Numeric.oid.decimal => return Numeric.encode(v, buf, format_pos),
+            else => {
+                var tmp: [64]u8 = undefined;
+                const s = try std.fmt.bufPrint(&tmp, "{d}", .{v});
+                return bindSlice(oid, s, buf, format_pos);
+            },
+        },
+        .text => |v| return bindSlice(oid, v, buf, format_pos),
     }
 }
 

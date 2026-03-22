@@ -7,6 +7,7 @@ const Result = lib.Result;
 const SSLCtx = lib.SSLCtx;
 const QueryRow = lib.QueryRow;
 const QueryRowUnsafe = lib.QueryRowUnsafe;
+const DynamicValue = lib.types.DynamicValue;
 const Listener = @import("listener.zig").Listener;
 
 const Thread = std.Thread;
@@ -232,6 +233,12 @@ pub const Pool = struct {
         var conn = try self.acquire();
         defer self.release(conn);
         return conn.execOpts(sql, values, opts);
+    }
+
+    pub fn execManyDynamic(self: *Pool, sql: []const u8, rows: []const []const DynamicValue, opts: Conn.QueryOpts) !i64 {
+        var conn = try self.acquire();
+        defer self.release(conn);
+        return conn.execManyDynamic(sql, rows, opts);
     }
 
     pub fn query(self: *Pool, sql: []const u8, values: anytype) !*Result {

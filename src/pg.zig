@@ -14,6 +14,7 @@ pub const Binary = lib.Binary;
 pub const Listener = @import("listener.zig").Listener;
 
 pub const types = lib.types;
+pub const DynamicValue = types.DynamicValue;
 pub const Cidr = types.Cidr;
 pub const Numeric = types.Numeric;
 pub const Vector = types.Vector;

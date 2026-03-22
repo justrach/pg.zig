@@ -253,7 +253,13 @@ pub const Stmt = struct {
 
         var buf = self.buf;
         buf.resetRetainingCapacity();
+        try self.startBindMessage(param_count);
+    }
 
+    pub fn startBindMessage(self: *Stmt, param_count: u16) !void {
+        self.param_index = 0;
+
+        var buf = self.buf;
         const name = self.name;
 
         // Bind command = 'B'
@@ -295,47 +301,56 @@ pub const Stmt = struct {
         self.param_index = param_index + 1;
     }
 
-    pub fn execute(self: *Stmt) !*Result {
+    pub fn bindDynamic(self: *Stmt, value: types.DynamicValue) !void {
+        const name = self.name;
+
+        const param_index = self.param_index;
+        lib.assert(param_index < self.param_count);
+
+        const format_offset = 9 + (param_index * 2) + name.len;
+
+        try types.bindDynamicValue(self.param_oids[param_index], value, self.buf, format_offset);
+        self.param_index = param_index + 1;
+    }
+
+    pub fn finishExecuteMessage(self: *Stmt, append_sync: bool) !void {
         lib.assert(self.param_index == self.param_count);
 
-        // We haven't sent our `bind` message yet. We need to finish it, and then
-        // send it, along with our `Execute` and a final `Sync` message.
-
         const buf = self.buf;
-        const conn = self.conn;
 
-        // The last part of the bind message is telling PostgreSQL the format we
-        // want to receive the result columns in.
         try lib.types.resultEncoding(self.result_state.oids[0..self.column_count], buf);
-
-        // write the full payload length, which always starts at byte 1 (after
-        // the 'B' message type)
-        // Reaching directly into buf.buf is bad!
-        // -1 because the length doesn't include the 'B'
-        std.mem.writeInt(u32, buf.buf[1..5], @intCast(buf.len() - 1), .big);
+        const bind_end = buf.len();
+        const bind_start = blk: {
+            var pos = bind_end;
+            while (pos > 0) : (pos -= 1) {
+                if (buf.buf[pos - 1] == 'B') break :blk pos - 1;
+            }
+            unreachable;
+        };
+        std.mem.writeInt(u32, buf.buf[bind_start + 1 .. bind_start + 5], @intCast(bind_end - bind_start - 1), .big);
 
         try buf.write(&.{
             'E',
-            // message length
             0,
             0,
             0,
             9,
-            // unname portal
-            0,
-            // no row limit
             0,
             0,
             0,
             0,
-            // sync
-            'S',
-            // message length
             0,
-            0,
-            0,
-            4,
         });
+        if (append_sync) {
+            try buf.write(&.{ 'S', 0, 0, 0, 4 });
+        }
+    }
+
+    pub fn execute(self: *Stmt) !*Result {
+        const buf = self.buf;
+        const conn = self.conn;
+
+        try self.finishExecuteMessage(true);
 
         try conn.write(buf.string());
 
