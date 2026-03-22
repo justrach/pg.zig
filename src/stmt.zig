@@ -327,7 +327,9 @@ pub const Stmt = struct {
             }
             unreachable;
         };
-        std.mem.writeInt(u32, buf.buf[bind_start + 1 .. bind_start + 5], @intCast(bind_end - bind_start - 1), .big);
+        var bind_len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bind_len, @intCast(bind_end - bind_start - 1), .big);
+        @memcpy(buf.buf[bind_start + 1 .. bind_start + 5], &bind_len);
 
         try buf.write(&.{
             'E',
