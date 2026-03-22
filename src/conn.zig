@@ -574,8 +574,13 @@ pub const Conn = struct {
             switch (msg.type) {
                 '2' => {},
                 'C' => {
-                    const cc = try proto.CommandComplete.parse(msg.data);
-                    total_rows += cc.rowsAffected() orelse 0;
+                    const data = msg.data;
+                    if (data.len >= 3 and data[data.len - 3] == ' ' and data[data.len - 2] == '1') {
+                        total_rows += 1;
+                    } else {
+                        const cc = try proto.CommandComplete.parse(data);
+                        total_rows += cc.rowsAffected() orelse 0;
+                    }
                     completed += 1;
                 },
                 'I' => completed += 1,
