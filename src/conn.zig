@@ -507,8 +507,8 @@ pub const Conn = struct {
         defer self._reader.endFlow() catch {
             self._state = .fail;
         };
-        const query = proto.Query{ .sql = sql_buf[0..sql_pos] };
-        try query.write(buf);
+        const copy_query = proto.Query{ .sql = sql_buf[0..sql_pos] };
+        try copy_query.write(buf);
         self._state = .query;
         try self.write(buf.string());
 
