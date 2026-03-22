@@ -304,7 +304,7 @@ pub const Stmt = struct {
         // We tell PostgreSQL the format (text or binary) of each parameter. This
         // information is at the start of the message, always starts at byte 9
         // and each value is 2 bytes.
-        const format_offset = 9 + (param_index * 2) + name.len;
+        const format_offset = self.bind_start + 9 + (param_index * 2) + name.len;
 
         try types.bindValue(@TypeOf(value), self.param_oids[param_index], value, self.buf, format_offset);
         self.param_index = param_index + 1;
@@ -316,7 +316,7 @@ pub const Stmt = struct {
         const param_index = self.param_index;
         lib.assert(param_index < self.param_count);
 
-        const format_offset = 9 + (param_index * 2) + name.len;
+        const format_offset = self.bind_start + 9 + (param_index * 2) + name.len;
 
         try types.bindDynamicValue(self.param_oids[param_index], value, self.buf, format_offset);
         self.param_index = param_index + 1;
