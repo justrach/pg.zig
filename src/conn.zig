@@ -409,7 +409,10 @@ pub const Conn = struct {
             return error.ConnectionBusy;
         }
         var buf = &self._buf;
-        buf.reset();
+        // Large repeated execs often reuse similarly sized SQL payloads. Keep
+        // the grown write buffer instead of dropping back to the tiny static
+        // buffer and forcing realloc/copy on the next call.
+        buf.resetRetainingCapacity();
 
         if (values.len == 0) {
             try self._reader.startFlow(opts.allocator, opts.timeout);
