@@ -469,6 +469,104 @@ pub const Conn = struct {
         _ = try self.execOpts("commit", .{}, .{});
     }
 
+    /// COPY FROM STDIN: bulk insert rows as tab-separated text.
+    /// Sends COPY command, then CopyData messages for each row, then CopyDone.
+    /// Returns number of rows inserted.
+    pub fn copyFrom(self: *Conn, table: []const u8, columns: []const []const u8, rows: []const []const []const u8) !i64 {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+
+        var buf = &self._buf;
+        buf.reset();
+
+        // Build COPY command: COPY table(col1,col2,...) FROM STDIN
+        var sql_buf: [1024]u8 = undefined;
+        var sql_pos: usize = 0;
+        const prefix = "COPY ";
+        @memcpy(sql_buf[sql_pos..][0..prefix.len], prefix);
+        sql_pos += prefix.len;
+        @memcpy(sql_buf[sql_pos..][0..table.len], table);
+        sql_pos += table.len;
+        sql_buf[sql_pos] = '(';
+        sql_pos += 1;
+        for (columns, 0..) |col, i| {
+            if (i > 0) {
+                sql_buf[sql_pos] = ',';
+                sql_pos += 1;
+            }
+            @memcpy(sql_buf[sql_pos..][0..col.len], col);
+            sql_pos += col.len;
+        }
+        const suffix = ") FROM STDIN";
+        @memcpy(sql_buf[sql_pos..][0..suffix.len], suffix);
+        sql_pos += suffix.len;
+
+        // Send as simple query
+        try self._reader.startFlow(null, null);
+        defer self._reader.endFlow() catch {
+            self._state = .fail;
+        };
+        const query = proto.Query{ .sql = sql_buf[0..sql_pos] };
+        try query.write(buf);
+        self._state = .query;
+        try self.write(buf.string());
+
+        // Expect CopyInResponse (type 'G')
+        const msg = try self.read();
+        if (msg.type != 'G') {
+            return self.unexpectedDBMessage();
+        }
+
+        // Send CopyData messages (type 'd'), each row as tab-separated text + newline
+        for (rows) |row| {
+            buf.reset();
+            // CopyData message: 'd' + length + data
+            try buf.writeByte('d');
+            const len_pos = buf.len();
+            try buf.write(&.{ 0, 0, 0, 0 }); // placeholder for length
+
+            for (row, 0..) |val, i| {
+                if (i > 0) try buf.writeByte('\t');
+                try buf.write(val);
+            }
+            try buf.writeByte('\n');
+
+            // Write length (includes itself but not the 'd')
+            const data_len: u32 = @intCast(buf.len() - len_pos);
+            var len_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_bytes, data_len, .big);
+            buf.writeAt(&len_bytes, len_pos);
+            try self.write(buf.string());
+        }
+
+        // Send CopyDone
+        buf.reset();
+        try buf.write(&.{ 'c', 0, 0, 0, 4 });
+        try self.write(buf.string());
+
+        // Read CommandComplete + ReadyForQuery
+        var row_count: i64 = 0;
+        while (true) {
+            const resp = try self.read();
+            switch (resp.type) {
+                'C' => {
+                    // CommandComplete: "COPY N"
+                    const data = resp.data;
+                    if (data.len > 5 and std.mem.startsWith(u8, data, "COPY ")) {
+                        row_count = std.fmt.parseInt(i64, data[5 .. data.len - 1], 10) catch 0;
+                    }
+                },
+                'Z' => break, // ReadyForQuery
+                'E' => return self.unexpectedDBMessage(),
+                else => {},
+            }
+        }
+
+        self._state = .idle;
+        return row_count;
+    }
+
     // ── Query Pipelining ────────────────────────────────────────────────
     // Send multiple queries over a single connection with one round trip.
     // All Bind+Execute messages are batched, with a single Sync at the end.
