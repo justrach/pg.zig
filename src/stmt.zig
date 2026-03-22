@@ -272,11 +272,13 @@ pub const Stmt = struct {
         // Bind command = 'B'
         // 4 byte length placeholder - 0, 0, 0, 0
         // portal name (empty string, length 0) - 0
-        // prepared statement name  + null terminator
-        try buf.ensureTotalCapacity(1 + 4 + 1 + name.len + 1 + 2);
+        // prepared statement name + null terminator
+        // parameter format count + parameter formats + value count
+        const bind_prefix_len = 1 + 4 + 1 + name.len + 1 + 2 + (param_count * 2) + 2;
+        try buf.ensureUnusedCapacity(bind_prefix_len);
 
-        // length of buffer is guaranteed to be 128, so it's safe to use
-        // writeAssumeCapacity (4 byte length placeholder, 1 byte empty portal)
+        // We reserved the fixed-size prefix above, so these append operations can
+        // skip their own bounds checks.
         buf.writeAssumeCapacity(&.{ 'B', 0, 0, 0, 0, 0 });
 
         buf.writeAssumeCapacity(name);
