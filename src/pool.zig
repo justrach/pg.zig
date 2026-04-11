@@ -34,6 +34,10 @@ pub const Pool = struct {
         connect_on_init_count: ?u16 = null,
         max_queries_per_conn: u64 = 0, // 0 = unlimited
         max_conn_lifetime: i64 = 0, // 0 = unlimited (seconds)
+        // SQL to run when returning a connection to the pool to clear session
+        // state. Set to null to disable. Avoids DEALLOCATE ALL to preserve
+        // the prepared statement cache.
+        reset_sql: ?[]const u8 = "RESET ALL; CLOSE ALL; UNLISTEN *",
     };
 
     pub const Stats = struct {
@@ -175,6 +179,17 @@ pub const Pool = struct {
             }
         }
 
+        // Reset session state before returning to the pool
+        if (!needs_replace) {
+            if (self._opts.reset_sql) |reset_sql| {
+                _ = conn.execOpts(reset_sql, .{}, .{}) catch {
+                    needs_replace = true;
+                };
+            }
+            // Also reset savepoint depth
+            conn._savepoint_depth = 0;
+        }
+
         if (needs_replace) {
             if (conn._state != .idle) {
                 lib.metrics.poolDirty();
@@ -273,6 +288,18 @@ pub const Pool = struct {
         opts.release_conn = true;
         var conn = try self.acquire();
         return conn.rowUnsafeOpts(sql, values, opts);
+    }
+
+    pub fn copyFrom(self: *Pool, table: []const u8, columns: []const []const u8, rows: []const []const []const u8) !i64 {
+        var conn = try self.acquire();
+        defer self.release(conn);
+        return conn.copyFrom(table, columns, rows);
+    }
+
+    pub fn copyTo(self: *Pool, allocator: std.mem.Allocator, table: []const u8, columns: []const []const u8) ![]const []const u8 {
+        var conn = try self.acquire();
+        defer self.release(conn);
+        return conn.copyTo(allocator, table, columns);
     }
 };
 
@@ -551,6 +578,82 @@ test "Pool: Row error" {
     try t.expectError(error.PG, pool.rowUnsafe("insert into all_types (id) values ($1)", .{200}));
 
     try t.expectEqual(1, pool._available);
+}
+
+test "Pool: reset on release" {
+    var pool = try Pool.init(t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+        .reset_sql = "RESET ALL; CLOSE ALL; UNLISTEN *",
+    });
+    defer pool.deinit();
+
+    // Set a session variable via the connection
+    {
+        var c = try pool.acquire();
+        defer pool.release(c);
+        _ = try c.exec("SET statement_timeout = '5s'", .{});
+
+        // Confirm it's set
+        var row = (try c.rowUnsafe("SHOW statement_timeout", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectString("5s", row.get([]u8, 0));
+    }
+
+    // Re-acquire (same conn from pool of 1) — reset should have cleared it
+    {
+        var c = try pool.acquire();
+        defer pool.release(c);
+        var row = (try c.rowUnsafe("SHOW statement_timeout", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectString("0", row.get([]u8, 0));
+    }
+}
+
+test "Pool: no reset when disabled" {
+    var pool = try Pool.init(t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+        .reset_sql = null,
+    });
+    defer pool.deinit();
+
+    {
+        var c = try pool.acquire();
+        defer pool.release(c);
+        _ = try c.exec("SET statement_timeout = '5s'", .{});
+    }
+
+    // Without reset, the session variable should persist
+    {
+        var c = try pool.acquire();
+        defer pool.release(c);
+        var row = (try c.rowUnsafe("SHOW statement_timeout", .{})).?;
+        defer row.deinit() catch {};
+        try t.expectString("5s", row.get([]u8, 0));
+    }
+}
+
+test "Pool: savepoint depth reset on release" {
+    var pool = try Pool.init(t.allocator, .{
+        .size = 1,
+        .auth = t.authOpts(.{}),
+    });
+    defer pool.deinit();
+
+    {
+        var c = try pool.acquire();
+        // Simulate leftover savepoint depth (e.g. from error path)
+        c._savepoint_depth = 3;
+        pool.release(c);
+    }
+
+    {
+        const c = try pool.acquire();
+        defer pool.release(c);
+        // Savepoint depth should be 0 after release reset
+        try t.expectEqual(@as(u16, 0), c._savepoint_depth);
+    }
 }
 
 fn testPool(p: *Pool) void {

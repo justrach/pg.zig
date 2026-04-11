@@ -27,6 +27,21 @@ pub fn isUnique(self: Error) bool {
     return std.mem.eql(u8, self.code, "23505");
 }
 
+    /// Returns true when PostgreSQL rejects a previously-cached prepared
+    /// statement because the underlying schema changed.  Codes checked:
+    ///   0A000 – "cached plan must not change result type"
+    ///   42P01 – undefined_table
+    ///   42703 – undefined_column
+    ///   42P18 – indeterminate_datatype
+    pub fn isCachedPlanError(self: Error) bool {
+        const code = self.code;
+        if (code.len != 5) return false;
+        return std.mem.eql(u8, code, "0A000") or
+            std.mem.eql(u8, code, "42P01") or
+            std.mem.eql(u8, code, "42703") or
+            std.mem.eql(u8, code, "42P18");
+    }
+
 pub fn parse(data: []const u8) Error {
     var err = Error{
         .code = "",

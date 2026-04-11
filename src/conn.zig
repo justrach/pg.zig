@@ -38,10 +38,10 @@ pub const Conn = struct {
     // Track connection age for pool rotation
     _query_count: u64 = 0,
     _created_at: i64 = 0,
+    _savepoint_depth: u16 = 0,
     // The current transation state, this is whatever the last ReadyForQuery
     // message told us
     _state: State,
-
     // A buffer used for writing to PG. This can grow dynamically as needed.
     _buf: Buffer,
 
@@ -256,6 +256,20 @@ pub const Conn = struct {
         }
     }
 
+    fn stmtCacheEvict(self: *Conn, name: []const u8) void {
+        if (self._prepared_statements.fetchRemove(name)) |kv| {
+            var describe = kv.value;
+            describe.arena.deinit();
+        }
+        const items = self._stmt_cache_order.items;
+        for (items, 0..) |item, i| {
+            if (std.mem.eql(u8, item, name)) {
+                _ = self._stmt_cache_order.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
     pub fn auth(self: *Conn, opts: AuthOpts) !void {
         if (try lib.auth.auth(&self._stream, &self._buf, &self._reader, opts)) |raw_pg_err| {
             return self.setErr(raw_pg_err);
@@ -356,6 +370,26 @@ pub const Conn = struct {
 
         return stmt.execute() catch |err| {
             stmt.deinit();
+
+            // If a cached statement failed because the schema changed,
+            // evict the cache entry and retry with a fresh prepare.
+            if (cached and err == error.PG) {
+                if (self.err) |pg_err| {
+                    if (pg_err.isCachedPlanError()) {
+                        self.err = null;
+                        if (self._err_data) |err_data| {
+                            self._allocator.free(err_data);
+                            self._err_data = null;
+                        }
+                        self.stmtCacheEvict(name.?);
+                        // Deallocate the server-side prepared statement so
+                        // the name is available for re-preparation.
+                        self.deallocate(name.?) catch {};
+                        return self.queryOpts(sql, values, opts);
+                    }
+                }
+            }
+
             self.maybeRelease(opts.release_conn);
             return err;
         };
@@ -552,11 +586,26 @@ pub const Conn = struct {
     }
 
     pub fn begin(self: *Conn) !void {
+        if (self._state == .transaction) {
+            self._savepoint_depth += 1;
+            var sp_buf: [32]u8 = undefined;
+            const sp = std.fmt.bufPrint(&sp_buf, "SAVEPOINT sp_{d}", .{self._savepoint_depth}) catch unreachable;
+            _ = try self.execOpts(sp, .{}, .{});
+            return;
+        }
         self._state = .transaction;
         _ = try self.execOpts("begin", .{}, .{});
     }
 
     pub fn commit(self: *Conn) !void {
+        if (self._savepoint_depth > 0) {
+            var sp_buf: [40]u8 = undefined;
+            const sp = std.fmt.bufPrint(&sp_buf, "RELEASE SAVEPOINT sp_{d}", .{self._savepoint_depth}) catch unreachable;
+            self._savepoint_depth -= 1;
+            _ = try self.execOpts(sp, .{}, .{});
+            return;
+        }
+        self._savepoint_depth = 0;
         _ = try self.execOpts("commit", .{}, .{});
     }
 
@@ -692,6 +741,110 @@ pub const Conn = struct {
         return row_count;
     }
 
+    /// COPY TO STDOUT: bulk read rows as tab-separated text.
+    /// Returns an allocated slice of row data slices (caller must free with
+    /// the provided allocator). Each entry is one tab-separated text row
+    /// (without the trailing newline).
+    pub fn copyTo(self: *Conn, allocator: Allocator, table: []const u8, columns: []const []const u8) ![]const []const u8 {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+
+        var buf = &self._buf;
+        buf.reset();
+
+        // Build COPY command: COPY table(col1,col2,...) TO STDOUT
+        var sql_buf: [1024]u8 = undefined;
+        var sql_pos: usize = 0;
+        const prefix = "COPY ";
+        @memcpy(sql_buf[sql_pos..][0..prefix.len], prefix);
+        sql_pos += prefix.len;
+        @memcpy(sql_buf[sql_pos..][0..table.len], table);
+        sql_pos += table.len;
+
+        if (columns.len > 0) {
+            sql_buf[sql_pos] = '(';
+            sql_pos += 1;
+            for (columns, 0..) |col, i| {
+                if (i > 0) {
+                    sql_buf[sql_pos] = ',';
+                    sql_pos += 1;
+                }
+                @memcpy(sql_buf[sql_pos..][0..col.len], col);
+                sql_pos += col.len;
+            }
+            sql_buf[sql_pos] = ')';
+            sql_pos += 1;
+        }
+
+        const suffix = " TO STDOUT";
+        @memcpy(sql_buf[sql_pos..][0..suffix.len], suffix);
+        sql_pos += suffix.len;
+
+        // Send as simple query
+        try self._reader.startFlow(null, null);
+        defer self._reader.endFlow() catch {
+            self._state = .fail;
+        };
+        const copy_query = proto.Query{ .sql = sql_buf[0..sql_pos] };
+        try copy_query.write(buf);
+        self._state = .query;
+        try self.write(buf.string());
+
+        // Expect CopyOutResponse (type 'H')
+        const msg = try self.read();
+        if (msg.type != 'H') {
+            return self.unexpectedDBMessage();
+        }
+
+        // Read CopyData messages until CopyDone
+        var rows: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (rows.items) |row_data| {
+                allocator.free(row_data);
+            }
+            rows.deinit(allocator);
+        }
+
+        while (true) {
+            const resp = self._reader.next() catch |err| {
+                self._state = .fail;
+                return err;
+            };
+            switch (resp.type) {
+                'd' => {
+                    // CopyData: the data is one text row (tab-separated, newline terminated)
+                    var data = resp.data;
+                    // Strip trailing newline if present
+                    if (data.len > 0 and data[data.len - 1] == '\n') {
+                        data = data[0 .. data.len - 1];
+                    }
+                    const owned = try allocator.dupe(u8, data);
+                    try rows.append(allocator, owned);
+                },
+                'c' => {}, // CopyDone
+                'C' => {}, // CommandComplete
+                'Z' => {
+                    self._state = switch (resp.data[0]) {
+                        'I' => .idle,
+                        'T' => .transaction,
+                        'E' => .fail,
+                        else => unreachable,
+                    };
+                    break;
+                },
+                'N' => {}, // NoticeResponse
+                'E' => {
+                    self._state = .fail;
+                    return self.setErr(resp.data);
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
+
+        return rows.toOwnedSlice(allocator);
+    }
+
     // ── Query Pipelining ────────────────────────────────────────────────
     // Send multiple queries over a single connection with one round trip.
     // All Bind+Execute messages are batched, with a single Sync at the end.
@@ -763,6 +916,17 @@ pub const Conn = struct {
     // just skipping over any data rows or any other in-flight messages there
     // might be.
     pub fn rollback(self: *Conn) !void {
+        // Savepoint rollback: we're still inside the outer transaction, so
+        // we can use the normal exec path.
+        if (self._savepoint_depth > 0) {
+            var sp_buf: [48]u8 = undefined;
+            const sp = std.fmt.bufPrint(&sp_buf, "ROLLBACK TO SAVEPOINT sp_{d}", .{self._savepoint_depth}) catch unreachable;
+            self._savepoint_depth -= 1;
+            _ = try self.execOpts(sp, .{}, .{});
+            return;
+        }
+
+        self._savepoint_depth = 0;
         var buf = &self._buf;
         buf.reset();
 
@@ -2334,6 +2498,205 @@ test "PG: cached query with column names" {
         try t.expectEqual(2, row.get(i32, 0));
         try t.expectString("ghanima", row.get([]u8, 1));
 
+        try t.expectEqual(null, try result.next());
+        result.deinit();
+    }
+}
+
+test "PG: nested savepoints commit" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    _ = try c.exec("delete from simple_table", .{});
+
+    try c.begin();
+    _ = try c.exec("insert into simple_table values ($1)", .{"outer"});
+
+    // nested begin -> SAVEPOINT sp_1
+    try c.begin();
+    _ = try c.exec("insert into simple_table values ($1)", .{"inner"});
+    try c.commit(); // RELEASE SAVEPOINT sp_1
+
+    try c.commit(); // real COMMIT
+
+    var result = try c.query("select value from simple_table order by value", .{});
+    defer result.deinit();
+
+    const r1 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectString("inner", r1.get([]u8, 0));
+    const r2 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectString("outer", r2.get([]u8, 0));
+    try t.expectEqual(null, try result.next());
+}
+
+test "PG: nested savepoints rollback inner" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    _ = try c.exec("delete from simple_table", .{});
+
+    try c.begin();
+    _ = try c.exec("insert into simple_table values ($1)", .{"outer"});
+
+    try c.begin(); // SAVEPOINT sp_1
+    _ = try c.exec("insert into simple_table values ($1)", .{"inner_rolled_back"});
+    try c.rollback(); // ROLLBACK TO SAVEPOINT sp_1
+
+    // outer transaction still alive
+    _ = try c.exec("insert into simple_table values ($1)", .{"after_rollback"});
+    try c.commit();
+
+    var result = try c.query("select value from simple_table order by value", .{});
+    defer result.deinit();
+
+    const r1 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectString("after_rollback", r1.get([]u8, 0));
+    const r2 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectString("outer", r2.get([]u8, 0));
+    try t.expectEqual(null, try result.next());
+}
+
+test "PG: deeply nested savepoints" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    _ = try c.exec("delete from simple_table", .{});
+
+    try c.begin(); // real BEGIN
+    _ = try c.exec("insert into simple_table values ($1)", .{"depth0"});
+
+    try c.begin(); // sp_1
+    _ = try c.exec("insert into simple_table values ($1)", .{"depth1"});
+
+    try c.begin(); // sp_2
+    _ = try c.exec("insert into simple_table values ($1)", .{"depth2"});
+
+    try c.rollback(); // rollback sp_2 -> depth2 gone
+
+    try c.commit(); // release sp_1
+    try c.commit(); // real COMMIT
+
+    var result = try c.query("select value from simple_table order by value", .{});
+    defer result.deinit();
+
+    const r1 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectString("depth0", r1.get([]u8, 0));
+    const r2 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectString("depth1", r2.get([]u8, 0));
+    try t.expectEqual(null, try result.next());
+}
+
+test "PG: copyFrom and copyTo" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    _ = try c.exec(
+        \\ drop table if exists copy_test;
+        \\ create table copy_test (id int not null, name text not null)
+    , .{});
+
+    // COPY FROM: bulk insert 3 rows
+    const rows_inserted = try c.copyFrom(
+        "copy_test",
+        &.{ "id", "name" },
+        &.{
+            &.{ "1", "alice" },
+            &.{ "2", "bob" },
+            &.{ "3", "charlie" },
+        },
+    );
+    try t.expectEqual(@as(i64, 3), rows_inserted);
+
+    // Verify with a normal query
+    var result = try c.query("select id, name from copy_test order by id", .{});
+    defer result.deinit();
+
+    const r1 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectEqual(1, r1.get(i32, 0));
+    try t.expectString("alice", r1.get([]u8, 1));
+
+    const r2 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectEqual(2, r2.get(i32, 0));
+    try t.expectString("bob", r2.get([]u8, 1));
+
+    const r3 = (try result.nextUnsafe()) orelse unreachable;
+    try t.expectEqual(3, r3.get(i32, 0));
+    try t.expectString("charlie", r3.get([]u8, 1));
+
+    try t.expectEqual(null, try result.next());
+}
+
+test "PG: copyTo" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    _ = try c.exec(
+        \\ drop table if exists copy_test;
+        \\ create table copy_test (id int not null, name text not null)
+    , .{});
+    _ = try c.exec("insert into copy_test values (10, 'x'), (20, 'y')", .{});
+
+    // COPY TO: read rows back as tab-separated text
+    const rows = try c.copyTo(t.allocator, "copy_test", &.{ "id", "name" });
+    defer {
+        for (rows) |row_data| {
+            t.allocator.free(row_data);
+        }
+        t.allocator.free(rows);
+    }
+
+    try t.expectEqual(@as(usize, 2), rows.len);
+    try t.expectString("10\tx", rows[0]);
+    try t.expectString("20\ty", rows[1]);
+}
+
+test "PG: copyTo empty table" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    _ = try c.exec(
+        \\ drop table if exists copy_empty;
+        \\ create table copy_empty (id int not null)
+    , .{});
+
+    const rows = try c.copyTo(t.allocator, "copy_empty", &.{});
+    defer t.allocator.free(rows);
+
+    try t.expectEqual(@as(usize, 0), rows.len);
+}
+
+test "PG: cache invalidation on schema change" {
+    var c = t.connect(.{});
+    defer c.deinit();
+
+    // Create a table and cache a query against it
+    _ = try c.exec(
+        \\ drop table if exists cache_inv_test;
+        \\ create table cache_inv_test (id int not null, val text)
+    , .{});
+    _ = try c.exec("insert into cache_inv_test values (1, 'a')", .{});
+
+    {
+        var result = try c.queryOpts("select id, val from cache_inv_test where id = $1", .{1}, .{ .cache_name = "ci1" });
+        const row = (try result.nextUnsafe()) orelse unreachable;
+        try t.expectEqual(1, row.get(i32, 0));
+        try t.expectString("a", row.get([]u8, 1));
+        try t.expectEqual(null, try result.next());
+        result.deinit();
+    }
+
+    // Drop and recreate the table with a different schema
+    _ = try c.exec("drop table cache_inv_test", .{});
+    _ = try c.exec("create table cache_inv_test (id int not null, val text, extra int)", .{});
+    _ = try c.exec("insert into cache_inv_test values (2, 'b', 99)", .{});
+
+    // The cached prepared statement is now stale. The auto-retry should
+    // evict the old plan and re-prepare transparently.
+    {
+        var result = try c.queryOpts("select id, val from cache_inv_test where id = $1", .{2}, .{ .cache_name = "ci1" });
+        const row = (try result.nextUnsafe()) orelse unreachable;
+        try t.expectEqual(2, row.get(i32, 0));
+        try t.expectString("b", row.get([]u8, 1));
         try t.expectEqual(null, try result.next());
         result.deinit();
     }
