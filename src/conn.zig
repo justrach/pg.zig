@@ -131,6 +131,29 @@ pub const Conn = struct {
         return try openAndAuth(allocator, po.opts.connect, po.opts.auth);
     }
 
+    /// Connect to a Cloud SQL Postgres instance via the Cloud SQL Auth Proxy
+    /// unix socket. Cloud Run mounts the socket at
+    /// `/cloudsql/PROJECT:REGION:INSTANCE/.s.PGSQL.5432` when the service is
+    /// deployed with `--add-cloudsql-instances PROJECT:REGION:INSTANCE`.
+    ///
+    /// `instance` must be the `"PROJECT:REGION:INSTANCE"` triple (no leading
+    /// slash, no `.s.PGSQL` suffix). Caller owns nothing — this helper builds
+    /// the path on `allocator` and frees it before returning.
+    ///
+    /// Cloud SQL Auth Proxy already terminates TLS, so no `tls` opt is
+    /// needed. For private-IP TCP setups, prefer `openAndAuth` with
+    /// `Opts.tls = .require` instead.
+    pub fn openCloudSqlSocket(
+        allocator: Allocator,
+        instance: []const u8,
+        ao: AuthOpts,
+    ) !Conn {
+        const path = try std.fmt.allocPrint(allocator, "/cloudsql/{s}/.s.PGSQL.5432", .{instance});
+        defer allocator.free(path);
+        return openAndAuth(allocator, .{ .host = path, .tls = .off }, ao);
+    }
+
+
     pub fn openAndAuth(allocator: Allocator, opts: Opts, ao: AuthOpts) !Conn {
         var conn = try open(allocator, opts);
         errdefer conn.deinit();
@@ -631,9 +654,15 @@ pub const Conn = struct {
     /// Non-blocking variant. Returns true if the lock was acquired, false if
     /// another session is currently holding it. Releases on commit/rollback.
     pub fn advisoryXactTryLock(self: *Conn, key1: i32, key2: i32) !bool {
-        var row = (try self.row("select pg_try_advisory_xact_lock($1, $2)", .{ key1, key2 })) orelse return false;
-        defer row.deinit() catch {};
-        return try row.get(bool, 0);
+        var result = try self.query("select pg_try_advisory_xact_lock($1, $2)", .{ key1, key2 });
+        defer result.deinit();
+
+        var value: bool = false;
+        if (try result.next()) |r| {
+            value = try r.get(bool, 0);
+        }
+        try result.drain();
+        return value;
     }
 
 
