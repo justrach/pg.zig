@@ -236,9 +236,8 @@ pub const Conn = struct {
         const items = self._stmt_cache_order.items;
         for (items, 0..) |item, i| {
             if (std.mem.eql(u8, item, name)) {
-                // Remove from current position, append to end
-                _ = self._stmt_cache_order.orderedRemove(i);
-                self._stmt_cache_order.append(self._allocator, name) catch {};
+                const cached_name = self._stmt_cache_order.orderedRemove(i);
+                self._stmt_cache_order.appendAssumeCapacity(cached_name);
                 return;
             }
         }
@@ -269,6 +268,17 @@ pub const Conn = struct {
                 return;
             }
         }
+    }
+
+    fn stmtCacheInsert(self: *Conn, name: []const u8, describe: Stmt.Describe) !void {
+        if (self._stmt_cache_order.items.len >= self._stmt_cache_max) {
+            self.stmtCacheEvictOldest();
+        }
+
+        try self._stmt_cache_order.append(self._allocator, name);
+        errdefer _ = self._stmt_cache_order.pop();
+
+        try self._prepared_statements.put(self._allocator, name, describe);
     }
 
     pub fn auth(self: *Conn, opts: AuthOpts) !void {
@@ -342,13 +352,8 @@ pub const Conn = struct {
                 errdefer describe_arena.deinit();
                 try stmt.prepare(sql, describe_arena.allocator());
 
-                // Evict LRU if cache is full
-                if (self._stmt_cache_order.items.len >= self._stmt_cache_max) {
-                    self.stmtCacheEvictOldest();
-                }
-
                 const owned_name = try describe_arena.allocator().dupe(u8, n);
-                try self._prepared_statements.put(self._allocator, owned_name, .{
+                try self.stmtCacheInsert(owned_name, .{
                     .arena = describe_arena,
                     .param_oids = stmt.param_oids,
                     .result_state = stmt.result_state,
@@ -475,12 +480,8 @@ pub const Conn = struct {
                 errdefer describe_arena.deinit();
                 try stmt.prepare(sql, describe_arena.allocator());
 
-                if (self._stmt_cache_order.items.len >= self._stmt_cache_max) {
-                    self.stmtCacheEvictOldest();
-                }
-
                 const owned_name = try describe_arena.allocator().dupe(u8, n);
-                try self._prepared_statements.put(self._allocator, owned_name, .{
+                try self.stmtCacheInsert(owned_name, .{
                     .arena = describe_arena,
                     .param_oids = stmt.param_oids,
                     .result_state = stmt.result_state,
@@ -610,6 +611,32 @@ pub const Conn = struct {
         _ = try self.execOpts("commit", .{}, .{});
     }
 
+    /// Acquire a transaction-scoped advisory lock. Must be called inside a
+    /// transaction (after `begin`); the lock releases automatically on commit
+    /// or rollback. The two-key form prevents collisions across products that
+    /// share a database.
+    ///
+    /// Recommended pattern for migration leader election:
+    /// ```
+    /// try conn.begin();
+    /// errdefer conn.rollback() catch {};
+    /// try conn.advisoryXactLock(0x7475_7262, 0x6f76_6c74); // "turb"|"ovlt"
+    /// // run migrations idempotently
+    /// try conn.commit();
+    /// ```
+    pub fn advisoryXactLock(self: *Conn, key1: i32, key2: i32) !void {
+        _ = try self.exec("select pg_advisory_xact_lock($1, $2)", .{ key1, key2 });
+    }
+
+    /// Non-blocking variant. Returns true if the lock was acquired, false if
+    /// another session is currently holding it. Releases on commit/rollback.
+    pub fn advisoryXactTryLock(self: *Conn, key1: i32, key2: i32) !bool {
+        var row = (try self.row("select pg_try_advisory_xact_lock($1, $2)", .{ key1, key2 })) orelse return false;
+        defer row.deinit() catch {};
+        return try row.get(bool, 0);
+    }
+
+
     fn consumeExecManyResponses(self: *Conn, expected: usize) !i64 {
         var completed: usize = 0;
         var total_rows: i64 = 0;
@@ -693,9 +720,16 @@ pub const Conn = struct {
             return self.unexpectedDBMessage();
         }
 
-        // Send CopyData messages (type 'd'), each row as tab-separated text + newline
+        // Send CopyData messages (type 'd'), batching rows to avoid a socket
+        // write per row for bulk imports.
+        const copy_batch_limit_bytes: usize = 256 * 1024;
+        buf.resetRetainingCapacity();
         for (rows) |copy_row| {
-            buf.reset();
+            if (buf.len() >= copy_batch_limit_bytes) {
+                try self.write(buf.string());
+                buf.resetRetainingCapacity();
+            }
+
             // CopyData message: 'd' + length + data
             try buf.writeByte('d');
             const len_pos = buf.len();
@@ -712,11 +746,14 @@ pub const Conn = struct {
             var len_bytes: [4]u8 = undefined;
             std.mem.writeInt(u32, &len_bytes, data_len, .big);
             buf.writeAt(&len_bytes, len_pos);
-            try self.write(buf.string());
+
+            if (buf.len() >= copy_batch_limit_bytes) {
+                try self.write(buf.string());
+                buf.resetRetainingCapacity();
+            }
         }
 
         // Send CopyDone
-        buf.reset();
         try buf.write(&.{ 'c', 0, 0, 0, 4 });
         try self.write(buf.string());
 
@@ -952,9 +989,7 @@ pub const Conn = struct {
     }
 
     pub fn deallocate(self: *Conn, cache_name: []const u8) !void {
-        if (self._prepared_statements.fetchRemove(cache_name)) |kv| {
-            kv.value.arena.deinit();
-        }
+        self.stmtCacheEvict(cache_name);
         const allocator = self._allocator;
         const sql = try std.fmt.allocPrint(allocator, "deallocate {s}", .{cache_name});
         defer allocator.free(sql);
