@@ -1,12 +1,15 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const sync = @import("sync.zig");
 
 const openssl = lib.openssl;
 
 const posix = std.posix;
+const net = std.Io.net;
 
 const Conn = lib.Conn;
 const Allocator = std.mem.Allocator;
+const NetStream = net.Stream;
 
 const DEFAULT_HOST = "127.0.0.1";
 
@@ -16,19 +19,20 @@ const TLSStream = struct {
     valid: bool,
     ssl: ?*openssl.SSL,
     socket: posix.socket_t,
+    stream: NetStream,
 
     pub fn connect(allocator: Allocator, opts: Conn.Opts, ctx_: ?*openssl.SSL_CTX) !Stream {
         const plain = try PlainStream.connect(allocator, opts, null);
         errdefer plain.close();
 
-        const socket = plain.socket;
+        const socket = plain.stream.socket.handle;
 
         var ssl: ?*openssl.SSL = null;
         if (ctx_) |ctx| {
             // PostgreSQL TLS starts off as a plain connection which we upgrade
-            try writeSocket(socket, &.{ 0, 0, 0, 8, 4, 210, 22, 47 });
+            try writeSocket(plain.stream, &.{ 0, 0, 0, 8, 4, 210, 22, 47 });
             var buf = [1]u8{0};
-            _ = try readSocket(socket, &buf);
+            _ = try readSocket(plain.stream, &buf);
             if (buf[0] != 'S') {
                 return error.SSLNotSupportedByServer;
             }
@@ -85,6 +89,7 @@ const TLSStream = struct {
             .ssl = ssl,
             .valid = true,
             .socket = socket,
+            .stream = plain.stream,
         };
     }
 
@@ -96,7 +101,7 @@ const TLSStream = struct {
             }
             openssl.SSL_free(ssl);
         }
-        posix.close(self.socket);
+        self.stream.close(sync.io());
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
@@ -108,7 +113,7 @@ const TLSStream = struct {
             }
             return;
         }
-        return writeSocket(self.socket, data);
+        return writeSocket(self.stream, data);
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
@@ -122,60 +127,74 @@ const TLSStream = struct {
             return read_len;
         }
 
-        return readSocket(self.socket, buf);
+        return readSocket(self.stream, buf);
     }
 };
 
 const PlainStream = struct {
     socket: posix.socket_t,
+    stream: NetStream,
 
     pub fn connect(allocator: Allocator, opts: Conn.Opts, _: anytype) !PlainStream {
-        const socket = blk: {
+        _ = allocator;
+        const stream = blk: {
             const host = opts.host orelse DEFAULT_HOST;
             if (host.len > 0 and host[0] == '/') {
-                if (comptime std.net.has_unix_sockets == false or std.posix.AF == void) {
+                if (comptime net.has_unix_sockets == false or std.posix.AF == void) {
                     return error.UnixPathNotSupported;
                 }
-                break :blk (try std.net.connectUnixSocket(host)).handle;
+                const address = try net.UnixAddress.init(host);
+                break :blk try address.connect(sync.io());
             }
             const port = opts.port orelse 5432;
-            break :blk (try std.net.tcpConnectToHost(allocator, host, port)).handle;
+            break :blk try tcpConnectToHost(host, port);
         };
-        errdefer posix.close(socket);
+        errdefer stream.close(sync.io());
 
         return .{
-            .socket = socket,
+            .socket = stream.socket.handle,
+            .stream = stream,
         };
     }
 
     pub fn close(self: *const PlainStream) void {
-        posix.close(self.socket);
+        self.stream.close(sync.io());
     }
 
     pub fn writeAll(self: *const PlainStream, data: []const u8) !void {
-        return writeSocket(self.socket, data);
+        return writeSocket(self.stream, data);
     }
 
     pub fn read(self: *const PlainStream, buf: []u8) !usize {
-        return readSocket(self.socket, buf);
+        return readSocket(self.stream, buf);
     }
 };
 
-fn readSocket(socket: posix.socket_t, buf: []u8) !usize {
-    const stream: std.net.Stream = .{ .handle = socket };
-    var vecs: [1][]u8 = .{buf};
-    var reader = stream.reader(&.{});
-    const r = reader.interface();
-    return try r.readVec(&vecs);
+fn tcpConnectToHost(host: []const u8, port: u16) !NetStream {
+    const io_ = sync.io();
+    const address = net.IpAddress.resolve(io_, host, port) catch {
+        const host_name = try net.HostName.init(host);
+        return net.HostName.connect(host_name, io_, port, .{ .mode = .stream });
+    };
+    return address.connect(io_, .{ .mode = .stream });
 }
 
-fn writeSocket(socket: posix.socket_t, data: []const u8) !void {
-    const stream: std.net.Stream = .{ .handle = socket };
+fn readSocket(stream: NetStream, buf: []u8) !usize {
+    var read_buf: [0]u8 = .{};
+    var vecs: [1][]u8 = .{buf};
+    var reader = stream.reader(sync.io(), &read_buf);
+    return reader.interface.readVec(&vecs) catch |err| switch (err) {
+        error.ReadFailed => return reader.err orelse err,
+        else => return err,
+    };
+}
+
+fn writeSocket(stream: NetStream, data: []const u8) !void {
     var buf: [1024]u8 = undefined;
-    var writer = stream.writer(&buf);
+    var writer = stream.writer(sync.io(), &buf);
     const w = &writer.interface;
-    try w.writeAll(data);
-    try w.flush();
+    w.writeAll(data) catch |err| return writer.err orelse err;
+    w.flush() catch |err| return writer.err orelse err;
 }
 
 fn isHostName(host: []const u8) bool {

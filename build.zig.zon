@@ -3,14 +3,15 @@
     .paths = .{""},
     .version = "0.0.0",
     .fingerprint = 0xbd309ff281fb9f5a,
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .buffer = .{
-            .url = "https://github.com/karlseguin/buffer.zig/archive/30f9512f61127efda1049c9064e533efa82c26f7.tar.gz",
-            .hash = "N-V-__8AAEGLAAB4JS8S1rWwdvXUTwnt7gRNthhJanWx4AvP"
+            .url = "git+https://github.com/karlseguin/buffer.zig?ref=master#a0de50267550666dc126051f672a8f0b55c44083",
+            .hash = "N-V-__8AAEGLAACZXqfn1yrAh1MKBAy7tUw-fQIEFU9bopsi",
         },
         .metrics = .{
-            .url = "https://github.com/karlseguin/metrics.zig/archive/13d8706e1ae921a8cc0d2f88283c1b5412c73e2f.tar.gz",
-            .hash = "metrics-0.0.0-W7G4eP2_AQBKsaql3dhLJ-pkf-RdP-zV3vflJy4N34jC"
-        }
+            .url = "git+https://github.com/karlseguin/metrics.zig?ref=master#6de29b83a750a06c438d268543e0e3c3c1b309da",
+            .hash = "metrics-0.0.0-W7G4eIegAQD4XxA9Co7Atbw59u_2zvxYf406AZuoAHPM",
+        },
     },
 }

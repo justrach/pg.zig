@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("sync.zig");
 
 const Allocator = std.mem.Allocator;
 const Conn = @import("conn.zig").Conn;
@@ -39,7 +40,7 @@ pub fn expectStringSlice(expected: []const []const u8, actual: [][]const u8) !vo
 
 pub fn getRandom() std.Random.DefaultPrng {
     var seed: u64 = undefined;
-    std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+    sync.io().random(std.mem.asBytes(&seed));
     return std.Random.DefaultPrng.init(seed);
 }
 
