@@ -223,10 +223,10 @@ test "Listener: from Pool" {
 }
 
 fn testListener(l: *Listener) !void {
-    var reset: std.Thread.ResetEvent = .{};
+    var reset: std.Io.Event = .unset;
     var tt = try std.Thread.spawn(.{}, struct {
-        fn shutdown(ll: *Listener, r: *std.Thread.ResetEvent) void {
-            r.wait();
+        fn shutdown(ll: *Listener, r: *std.Io.Event) void {
+            r.waitUncancelable(lib.sync.io());
             ll.stop();
         }
     }.shutdown, .{ l, &reset });
@@ -254,7 +254,7 @@ fn testListener(l: *Listener) !void {
         try t.expectString("", notification.payload);
     }
 
-    reset.set();
+    reset.set(lib.sync.io());
     try t.expectEqual(null, l.next());
     thrd.join();
 }

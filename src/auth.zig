@@ -169,7 +169,7 @@ const SASL = struct {
 
     pub fn init(allocator: Allocator) !SASL {
         var nonce: [18]u8 = undefined;
-        std.crypto.random.bytes(&nonce);
+        lib.sync.io().random(&nonce);
 
         var client_first_message = try allocator.alloc(u8, 32);
         client_first_message[0] = 'n';

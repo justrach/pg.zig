@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const sync = @import("sync.zig");
 const Buffer = @import("buffer").Buffer;
 
 const proto = lib.proto;
@@ -183,9 +184,9 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
-            ._stmt_cache_order = .{},
+            ._stmt_cache_order = .empty,
             ._stmt_cache_max = 256,
-            ._created_at = std.time.timestamp(),
+            ._created_at = sync.timestamp(),
         };
     }
 
@@ -226,7 +227,7 @@ pub const Conn = struct {
     }
 
     pub fn age(self: *const Conn) i64 {
-        return std.time.timestamp() - self._created_at;
+        return sync.timestamp() - self._created_at;
     }
 
     // ── LRU stmt cache helpers ──────────────────────────────────────────

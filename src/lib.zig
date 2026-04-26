@@ -10,6 +10,7 @@ const build_config = @import("config");
 
 pub const log = std.log.scoped(.pg);
 
+pub const sync = @import("sync.zig");
 pub const types = @import("types.zig");
 pub const proto = @import("proto.zig");
 pub const auth = @import("auth.zig");
@@ -176,7 +177,7 @@ pub fn parseOpts(uri: std.Uri, allocator: std.mem.Allocator) !ParsedOpts {
         }
     }
 
-    const path = std.mem.trimLeft(u8, try uri.path.toRawMaybeAlloc(aa), "/");
+    const path = std.mem.trimStart(u8, try uri.path.toRawMaybeAlloc(aa), "/");
     const host = if (uri.host) |host| try host.toRawMaybeAlloc(aa) else null;
     const username = if (uri.user) |user| try user.toRawMaybeAlloc(aa) else "postgres";
     const password = if (uri.password) |password| try password.toRawMaybeAlloc(aa) else null;

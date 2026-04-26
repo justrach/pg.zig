@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const sync = @import("sync.zig");
 
 const log = lib.log;
 const Conn = lib.Conn;
@@ -20,8 +21,8 @@ pub const Pool = struct {
     _available: usize,
     _missing: usize,
     _allocator: Allocator,
-    _mutex: Thread.Mutex,
-    _cond: Thread.Condition,
+    _mutex: sync.Mutex,
+    _cond: sync.Condition,
     _ssl_ctx: ?*lib.SSLCtx,
     _reconnector: Reconnector,
     _arena: std.heap.ArenaAllocator,
@@ -128,7 +129,7 @@ pub const Pool = struct {
 
     pub fn acquire(self: *Pool) !*Conn {
         const conns = self._conns;
-        const deadline = std.time.nanoTimestamp() + @as(i64, @intCast(self._timeout));
+        const deadline = sync.nanoTimestamp() + @as(i128, self._timeout);
 
         self._mutex.lock();
         errdefer self._mutex.unlock();
@@ -147,7 +148,7 @@ pub const Pool = struct {
                 lib.metrics.poolEmpty();
 
                 // Calculate remaining timeout
-                const now = std.time.nanoTimestamp();
+                const now = sync.nanoTimestamp();
                 if (now >= deadline) {
                     return error.Timeout;
                 }
@@ -312,7 +313,7 @@ const Reconnector = struct {
     stopped: bool,
 
     pool: *Pool,
-    mutex: Thread.Mutex,
+    mutex: sync.Mutex,
 
     // the thread, if any, that the monitor is running in
     thread: ?Thread,
@@ -341,7 +342,7 @@ const Reconnector = struct {
             }
 
             const conn = newConnection(pool, false) catch {
-                std.Thread.sleep(retry_delay);
+                sync.sleep(retry_delay);
                 self.mutex.lock();
                 continue :loop;
             };
